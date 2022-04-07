@@ -8,10 +8,10 @@ import tensorflow_probability as tfp
 
 from .util import scope_name
 
-def layer(h, dim = None, fun = None, name = None, l2_scale = 1e-50, l1_scale = 1e-50,
+def layer(h, dim = None, fun = None, name = 'dense', l2_scale = 1e-50, l1_scale = 1e-50,
           drop = None,  batch_norm = None, custom = False, W = None, b = None, probability = False,
           kernel_initializer = tf.contrib.layers.xavier_initializer(uniform = False),
-          bias_initializer = tf.zeros_initializer(), use_bias = True, graph = None, axis_batch = -2, match_dim = False, reuse = False):
+          bias_initializer = tf.zeros_initializer(), use_bias = True, graph = None, axis_batch = -2, match_dim = False, reuse = True):
     """ defines a layer using tf.layers """
 
     variable_scope = 'layer'
@@ -24,7 +24,7 @@ def layer(h, dim = None, fun = None, name = None, l2_scale = 1e-50, l1_scale = 1
     else:
         regularizer = tf.contrib.layers.l1_regularizer(scale = l1_scale)
 
-    with tf.variable_scope(variable_scope):
+    with tf.variable_scope(variable_scope, reuse=tf.AUTO_REUSE):
 
         if batch_norm is not None:
             h = tf.layers.batch_normalization(h, training=batch_norm)
@@ -45,12 +45,14 @@ def layer(h, dim = None, fun = None, name = None, l2_scale = 1e-50, l1_scale = 1
                                 bias_initializer = bias_initializer,
                                 name = name)
 
-            W = tf.get_default_graph().get_tensor_by_name(os.path.split(h.name)[0] + '/kernel:0')
+            with tf.variable_scope(name, reuse=tf.AUTO_REUSE):
 
-            if use_bias:
-                if b is not None:
-                    raise Exception('Warning: b is not being used with tf.layer.dense, set custom to True')
-                b = tf.get_default_graph().get_tensor_by_name(os.path.split(h.name)[0] + '/bias:0')
+                W = tf.get_variable('kernel')
+
+                if use_bias:
+                    if b is not None:
+                        raise Exception('Warning: b is not being used with tf.layer.dense, set custom to True')
+                    b = tf.get_variable('bias')
 
         else:
             logging.info('custom')
@@ -67,8 +69,7 @@ def layer(h, dim = None, fun = None, name = None, l2_scale = 1e-50, l1_scale = 1
                     shape_b = [dim]
 
             kwargs = {'dtype'      : tf.float32,
-                      'trainable'  : True
-            }
+                      'trainable'  : True}
 
             variable_scope = scope_name('dense')
 
@@ -205,9 +206,18 @@ class Distribution():
 
     """ Create probability layer """
 
-    def __init__(self, h, dim, h_mu = None, h_std = None, fun = None, name = None, l2_scale = 1e-50, l1_scale = 1e-50,
-                     drop = None,  batch_norm = None, custom = False,
-                     epsilon = 1e-5, var_dependency = True, var_type = 'diagonal', activation_fun = tf.nn.softplus):
+    def __init__(self, h, dim, input = None, h_mu = None, h_std = None, fun = None, name = None,
+                 l2_scale = 1e-50, l1_scale = 1e-50,
+                 drop = None,  batch_norm = None, custom = False,
+                 epsilon = 1e-5, var_dependency = True, var_type = 'diagonal',
+                 activation_fun = tf.nn.softplus,
+                 distribution = 'normal'):
+
+        self.distribution   = distribution
+        self.var_type       = var_type
+        self.var_dependency = var_dependency
+        self.batch_norm     = batch_norm
+        self.eps            = epsilon
 
         if not var_type in ['scalar','diagonal','deterministic','identity']:
             raise Exception('Invalid input for var_type({})'.format(var_type))
@@ -218,52 +228,125 @@ class Distribution():
                                      l2_scale = l2_scale, l1_scale = l1_scale,
                                      drop = drop,  batch_norm = batch_norm, custom = custom)
 
-        if var_type == 'deterministic':
+        if distribution == 'normal':
 
-            h_sample = h_mu
-            h_std = None
-            h_var = None
-            h_logvar = None
-            h_epsilon = None
-            h_dist = None
+            if var_type == 'deterministic':
 
-        else:
-            with tf.variable_scope('var'):
+                h_sample = h_mu
+                h_std = None
+                h_var = None
+                h_logvar = None
+                h_epsilon = None
+                h_dist = None
 
-                if h_std is None:
-
-                    h_std = create_variance(h = h, dim = dim, var_dependency = var_dependency, var_type = var_type, activation_fun = activation_fun,
-                                            batch_norm = None, custom = custom, l2_scale = 1e-50, l1_scale = 1e-50, drop = None,
-                                            kernel_initializer = tf.zeros_initializer,
-                                            bias_initializer = tf.zeros_initializer,
-                                            epsilon = epsilon)
-
-                h_var = tf.square(h_std)
-                h_logvar = tf.log(h_var + epsilon)
-
-            if var_type == 'fullcov':
-                h_dist = tfp.distributions.MultivariateNormalFullCovariance(loc = h_mu,
-                                                                            covariance_matrix = h_std,
-                                                                            allow_nan_stats = False,
-                                                                            validate_args = True,
-                                                                            name = 'distribution')
             else:
-                h_dist = tfp.distributions.MultivariateNormalDiag(loc = h_mu,
-                                                                  scale_diag = h_std,
-                                                                  allow_nan_stats = False,
-                                                                  validate_args = True,
-                                                                  name = 'distribution')
+                with tf.variable_scope('var'):
 
-            h_sample = h_dist.sample()
+                    if h_std is None:
+
+                        h_std = create_variance(h = h, dim = dim, var_dependency = var_dependency, var_type = var_type,
+                                                activation_fun = activation_fun, batch_norm = None, custom = custom,
+                                                l2_scale = l2_scale, l1_scale = l1_scale, drop = drop,
+                                                kernel_initializer = tf.zeros_initializer,
+                                                bias_initializer = tf.zeros_initializer,
+                                                epsilon = epsilon)
+
+                    h_var = tf.square(h_std)
+                    h_logvar = tf.log(h_var + epsilon)
+
+                if var_type == 'fullcov':
+                    h_dist = tfp.distributions.MultivariateNormalFullCovariance(loc = h_mu,
+                                                                                covariance_matrix = h_std,
+                                                                                allow_nan_stats = False,
+                                                                                validate_args = True,
+                                                                                name = 'distribution')
+                else:
+                    h_dist = tfp.distributions.MultivariateNormalDiag(loc = h_mu,
+                                                                      scale_diag = h_std,
+                                                                      allow_nan_stats = False,
+                                                                      validate_args = True,
+                                                                      name = 'distribution')
+                h_sample = h_dist.sample()
+
             h_epsilon = tf.zeros(tf.shape(h_mu))
 
-        self.dist    = h_dist
-        self.sample  = h_sample
-        self.mu      = h_mu
-        self.std     = h_std
-        self.var     = h_var
-        self.logvar  = h_logvar
-        self.epsilon = h_epsilon
+            self.dist    = h_dist
+            self.sample  = h_sample
+            self.mu      = h_mu
+            self.std     = h_std
+            self.var     = h_var
+            self.logvar  = h_logvar
+            self.epsilon = h_epsilon
+
+        elif distribution == 'negativebinomial':
+
+            print('Creating negative binomial distribution')
+            print('dim: {}'.format(dim))
+
+            ## Define mean (mu)
+            with tf.variable_scope('mu'):
+
+                predict_mu_prob = True
+
+                ## mu shoudl be positive
+                if predict_mu_prob:
+                    ## Per cell, predict the distribution of library to individual genes using softmax
+                    ## Calculate library size per cell
+                    self.library_mu = tf.expand_dims(tf.reduce_sum(input,-1),-1)
+                    ## Calculate distribution per cell
+                    self.mu_prob = tf.nn.softmax(h_mu,axis=-1)
+                    self.library = self.library_mu
+                    # self.library_mu = 1
+                else:
+                    self.mu_prob = tf.nn.softmax(h_mu,axis=-1)
+                    self.library_mu = 1
+
+                self.mu = self.mu_prob * self.library_mu
+
+            ## Define dispersion (theta)
+            with tf.variable_scope('r'):
+                self.theta = tf.get_variable(name = 'theta',
+                                             shape = self.mu.shape[-1],
+                                             initializer = tf.ones_initializer)
+                self.theta = tf.exp(self.theta)
+                # self.theta = tf.ones(1)
+
+            self.var = self.theta
+            self.std = self.theta
+            self.logvar = self.theta
+            self.sample  = self.mu
+            self.epsilon = None
+            self.dist = None
+
+        else:
+            raise Exception('{} is invalid distribution type '.format(distribution))
+
 
     def get_tensors(self):
+        """ Get tensors for all """
         return [self.sample, self.mu, self.var, self.logvar, self.epsilon]
+
+
+    def log_prob(self,X,mu=None,theta=None):
+        """ Calculate log probability of distribution object """
+
+        if self.distribution == 'negativebinomial':
+
+            if mu is None:
+                mu = self.mu
+            if theta is None:
+                theta = self.theta
+
+            ## Formulation from scVI
+            log_theta_mu_eps = tf.log(theta + mu + self.eps)
+            logprob = theta*(tf.log(theta+self.eps) - log_theta_mu_eps) \
+                      + X * (tf.log(mu+self.eps) - log_theta_mu_eps) \
+                      + tf.math.lgamma(X + theta) \
+                      - tf.lgamma(theta) \
+                      - tf.lgamma(X+1)
+            logprob = tf.reduce_sum(logprob,-1)
+
+        else:
+            logprob = self.dist.log_prob(X)
+
+        return logprob

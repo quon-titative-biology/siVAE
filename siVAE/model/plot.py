@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 
 
+
 def calculate_vmax_vmin(X, cutoff = 0.01):
     """
     X list or arrays of values to be flattened
@@ -27,11 +28,14 @@ def calculate_vmax_vmin(X, cutoff = 0.01):
 
 
 def plot_images(X_plots, colnames = None, rownames = None, vmax = None, vmin = None, cutoff = None, center = 0,
-                fs_scale = 2, vmaxmin_type = 'individual', cmap = 'RdBu', **kwargs):
+                fs_scale = 2, vmaxmin_type = 'individual', cmap = 'RdBu', wspace=0, hspace=0,cbar=False,**kwargs):
     """
-    X_images: col x row x images
-    colnames: list of colnames (including the first column)
-    rownames: either dict or a list of information for each row
+    parameters
+    ----------
+        X_images: col x row x images
+        colnames: list of colnames (including the first column)
+        rownames: either dict or a list of information for each row
+        vmaxmin_type: [all, row, col, individual]
     """
     #
     plot_args = {}
@@ -89,13 +93,15 @@ def plot_images(X_plots, colnames = None, rownames = None, vmax = None, vmin = N
                         plot_args['vmin'] = vmins[irow][icol-1]
                     ##
                     X_plot = X_plot.sum(-1)
-                    g = sns.heatmap(X_plot,ax=ax,cmap=cmap,cbar=False,
+                    g = sns.heatmap(X_plot,ax=ax,cmap=cmap,cbar=cbar,
                                     xticklabels=False,yticklabels=False, center = center,
                                     **plot_args, **kwargs)
                 else:
                     _ = ax.imshow(X_plot)
                     _ = ax.set_axis_off()
             ax.set(adjustable='box', aspect='equal')
+    #
+    fig.subplots_adjust(wspace=0, hspace=0)
     #
     return fig, axes
 

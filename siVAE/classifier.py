@@ -12,6 +12,8 @@ from .data.data_handler import kfold_split
 
 
 def run_classifier(X_train, X_test, y_train, y_test, classifier = "KNeighborsClassifier", max_dim = 1e6, args = {}):
+    """ Run classifier """
+
     if classifier == "KNeighborsClassifier":
         clf = KNeighborsClassifier(**args)
     elif classifier == "LogisticRegression":
@@ -19,9 +21,12 @@ def run_classifier(X_train, X_test, y_train, y_test, classifier = "KNeighborsCla
     elif classifier == "MLPClassifier":
         clf = MLPClassifier(**args)
     else:
-        raise Exception("Input valid classifier")
+        raise ValueError("Input valid classifier")
+
     _ = clf.fit(X_train,y_train)
+
     score = clf.score(X_test,y_test)
+
     return score, clf
 
 

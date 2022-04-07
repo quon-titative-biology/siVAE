@@ -16,14 +16,21 @@ from .layer import create_variance
 from .layer import Distribution
 
 from .util import batch_handler
+from .util import extract_scalar_from_tensorboard
 
-class AutoEncoder(object):
+from .output.output_handler import output_handler
+
+class VAE(object):
 
     def __init__(self, logdir_tf = ".", data_handler = None, X_dim = None,
                  h_dims = None, LE_dim = None, architecture = None,
-                 iter = 5000, mb_size = 1000, learning_rate = 1e-3, l1_scale = 1e-50, l2_scale = 0,
-                 early_stopping = 0, tolerance = 0, min_early_stopping = 0,
-                 activation_fun = tf.nn.relu, random_seed = 0, log_frequency = 100,
+                 iter = 5000, mb_size = 1000, learning_rate = 1e-3,
+                 l1_scale = 1e-50, l2_scale = 0.0, l2_scale_final = None,
+                 grad_clipping=False,
+                 early_stopping = False, tolerance = 0, min_early_stopping = 0, max_patience_count = 100,
+                 activation_fun = tf.nn.relu, activation_fun_encoder = "default",
+                 activation_fun_decoder = "default",
+                 random_seed = 0, log_frequency = 100,
                  batch_norm = False, keep_prob = None,
                  dataAPI = False, tensorboard = False, metadata = False,
                  config = None, validation_split = 0,
@@ -33,7 +40,8 @@ class AutoEncoder(object):
                  name = "", var_dependency = True, optimizer_type = 'adam',
                  kernel_initializer = tf.contrib.layers.xavier_initializer(uniform = False),
                  X_mu_use_bias = True, beta_warmup = 0.5, y_var_type = 'deterministic',
-                 classifier = False, attributions_dict = {}):
+                 classifier = False, attributions_dict = {}, output_distribution = 'normal',
+                 log_variational = False, assign_dict={}, use_batch=False, **kwargs):
 
         self.iterator = None
         self.isVAE = isVAE
@@ -43,6 +51,10 @@ class AutoEncoder(object):
         self.X_mu_use_bias = X_mu_use_bias
         self.beta_warmup = beta_warmup
         self.beta = beta
+        self.output_distribution = output_distribution
+        self.log_variational = log_variational
+        self.use_batch = use_batch
+
         if not self.isVAE and decoder_var != 'deterministic':
             raise Exception("When isVAE is False, decoder_var must be set to deterministic")
 
@@ -59,6 +71,11 @@ class AutoEncoder(object):
         self.X_shape        = shape_X
         self.X_target_shape = shape_y
 
+        if self.use_batch:
+            shape_batch = list(self.data_handler.batch.shape)
+            shape_batch[0] = None
+            self.batch_shape = shape_batch
+
         ## Recalculate h_dims if h_dims = 0
         self.save_LE = save_LE
         self.save_W = save_W
@@ -73,6 +90,14 @@ class AutoEncoder(object):
 
         ## Set activation function
         self.activation_fun = activation_fun
+        if activation_fun_decoder == "default":
+            self.activation_fun_decoder = self.activation_fun
+        else:
+            self.activation_fun_decoder = activation_fun_decoder
+        if activation_fun_encoder == "default":
+            self.activation_fun_encoder = self.activation_fun
+        else:
+            self.activation_fun_encoder = activation_fun_encoder
 
         ## Training Parameters
         self.mb_size = mb_size
@@ -85,6 +110,10 @@ class AutoEncoder(object):
         ## Hyperparameters
         self.learning_rate = learning_rate
         self.l2_scale = l2_scale
+        if l2_scale_final is None:
+            self.l2_scale_final = l2_scale
+        else:
+            self.l2_scale_final = l2_scale_final
         self.l1_scale = l1_scale
         self.random_seed = random_seed
 
@@ -113,9 +142,19 @@ class AutoEncoder(object):
         self.dataAPI = dataAPI
         self.config = config
 
+        ## Beta-warmup
+        if self.beta_warmup <= 1:
+            self.iter_beta_full = self.iter * self.beta_warmup
+        else:
+            self.iter_beta_full = self.beta_warmup
+
+        ## Early Stopping
         self.early_stopping = early_stopping
-        self.min_early_stopping = np.max([min_early_stopping, self.beta_warmup])
+        self.max_patience_count = max_patience_count
+        self.min_early_stopping = np.max([min_early_stopping, self.iter_beta_full])
         self.iter_min_early_stopping = int(self.iter * self.min_early_stopping)
+
+        self.grad_clipping = grad_clipping
 
         for attribution,value in attributions_dict.items():
             setattr(self,attribution,value)
@@ -190,6 +229,11 @@ class AutoEncoder(object):
                 with tf.name_scope('X_target_placeholder'):
                     self.X_target = tf.placeholder(tf.float32, shape=self.X_target_shape, name = 'X_target')
 
+            if not hasattr(self, 'batch') and self.use_batch:
+                with tf.name_scope('batch_placeholder'):
+                    self.batch = tf.placeholder(tf.float32, shape=self.batch_shape, name = 'batch')
+
+
         if dataAPI:
             self.dataAPI_placeholders = [self.X,self.X_target]
 
@@ -230,11 +274,8 @@ class AutoEncoder(object):
 
         with tf.name_scope('log_likelihood'):
             if self.isVAE and self.decoder_var != 'deterministic':
-                self.decoder_loss_old = self.X_logvar / 2 + self.recon_loss_ae / self.X_var / 2 + tf.constant(0.5 * np.log(2. * np.pi), dtype = self.X_var.dtype)
-                self.decoder_loss_mse    = tf.square(self.X_mu - self.X_target)
-                self.decoder_loss_mse_scaled = self.recon_loss_ae / self.X_var / 2
-                self.decoder_loss_logvar = self.decoder_loss_mse * 0 + self.X_logvar / 2
-                self.decoder_loss = -self.X_dist.dist.log_prob(self.X_target)
+                self.decoder_loss = -self.X_dist.log_prob(self.X_target)
+
             else:
                 self.decoder_loss = tf.reduce_sum(self.recon_loss_ae,-1)
 
@@ -255,7 +296,7 @@ class AutoEncoder(object):
                         ## Create hidden layers
                         h_temp,_,_ = layer(h = h_temp,
                                            dim = h_dim,
-                                           fun = self.activation_fun,
+                                           fun = self.activation_fun_encoder,
                                            l2_scale = l2_scale_encoder,
                                            l1_scale = l1_scale_encoder,
                                            kernel_initializer = kernel_initializer,
@@ -271,8 +312,8 @@ class AutoEncoder(object):
                         prob_layer = Distribution(h = h_temp,
                                                   dim = h_dim,
                                                   fun = None,
-                                                  l2_scale = l2_scale_encoder,
-                                                  l1_scale = l1_scale_encoder,
+                                                  l2_scale = 0.0,
+                                                  l1_scale = 0.0,
                                                   var_type = 'diagonal')
 
                 self.hidden_layers.append(h_temp)
@@ -286,17 +327,18 @@ class AutoEncoder(object):
 
         self.decoder_layers = []
 
-        with tf.variable_scope(variable_scope):
+        with tf.variable_scope(variable_scope, reuse = tf.AUTO_REUSE):
+
+            # self.decoder_variable_scope = tf.get_variable_scope().name
 
             for ii, h_dim in enumerate(h_dims):
 
                 with tf.variable_scope("hidden_layer_{}".format(ii)):
 
                     if ii < len(h_dims) - 2:
-                        ## Hidden layers
-                        fun = self.activation_fun
 
-                        h_temp,_,_ = layer(h = h_temp, dim = h_dim, fun = fun,
+                        ## Hidden layers
+                        h_temp,_,_ = layer(h = h_temp, dim = h_dim, fun = self.activation_fun_decoder,
                                            l2_scale = l2_scale, l1_scale = l1_scale,
                                            kernel_initializer = kernel_initializer)
 
@@ -315,7 +357,7 @@ class AutoEncoder(object):
                         h_temp = self.y_sample
 
                     elif ii == len(h_dims) - 1:
-
+                        ## Final layer
                         ## If there is no y layer, set y to z
                         if len(h_dims) == 1:
                             self.y_dist = self.z_dist
@@ -330,10 +372,10 @@ class AutoEncoder(object):
                             self.output_variable_scope = tf.get_variable_scope().name
 
                             prob_layer,W,b = self.build_output_layer(h_temp, h_dim = h_dim,
-                                                                     fun = self.activation_fun,
+                                                                     fun = None,
                                                                      var_type = self.decoder_var,
                                                                      var_dependency = self.var_dependency,
-                                                                     l2_scale = l2_scale,
+                                                                     l2_scale = self.l2_scale_final,
                                                                      l1_scale = l1_scale,
                                                                      use_bias = self.X_mu_use_bias)
 
@@ -354,8 +396,9 @@ class AutoEncoder(object):
     def build_output_layer(self, h_temp, fun, var_type, var_dependency, l2_scale, l1_scale, use_bias,
                            h_dim = None, W = None, b = None, h_mu = None, h_std = None, custom = False, **kwargs):
         """"""
-
-        h_mu, W, b = layer(h_temp, h_dim, fun = None,
+        print('Build output layer')
+        print('h_dim: {}'.format(h_dim))
+        h_mu, W, b = layer(h_temp, h_dim, fun = fun,
                            name = "{}_{}".format('X','mu'),
                            l1_scale = l1_scale, l2_scale = l2_scale,
                            custom = custom, use_bias = use_bias,
@@ -363,15 +406,18 @@ class AutoEncoder(object):
 
 
         with tf.variable_scope('Distribution'):
+            print('creating distribution')
             prob_layer  = Distribution(h = h_temp,
                                        h_mu = h_mu,
                                        h_std = h_std,
                                        dim = h_dim,
-                                       fun = None,
+                                       fun = fun,
                                        var_type = var_type,
                                        var_dependency = var_dependency,
                                        l2_scale = l2_scale,
                                        l1_scale = l1_scale,
+                                       distribution = self.output_distribution,
+                                       input        = self.X,
                                        **kwargs)
 
         return prob_layer, W, b
@@ -387,7 +433,13 @@ class AutoEncoder(object):
         logging.info("Building Basic Network")
 
         with tf.variable_scope('NN'):
-            self.X_out = self.predict_X(self.initial_feed)
+
+            if self.log_variational:
+                X_in = tf.log(self.initial_feed+1)
+            else:
+                X_in = self.initial_feed
+
+            self.X_out = self.predict_X(X_in)
 
         with tf.name_scope('losses'):
 
@@ -401,7 +453,6 @@ class AutoEncoder(object):
             # VAE
             self.create_loss()
 
-
     def create_loss(self):
         """ """
         logging.info("Creating loss")
@@ -411,18 +462,16 @@ class AutoEncoder(object):
         ## Set up optimizer
         with tf.name_scope("global_steps"):
 
-
             self.global_step = tf.Variable(0, name='global_step', trainable=False)
 
-            self.decayed_learning_rate= tf.train.exponential_decay(learning_rate = self.learning_rate,
-                                                                   global_step   = self.global_step,
-                                                                   decay_steps   = self.decay_steps,
-                                                                   decay_rate    = self.decay_rate,
-                                                                   staircase     = False)
+            self.decayed_learning_rate = tf.train.exponential_decay(learning_rate = self.learning_rate,
+                                                                    global_step   = self.global_step,
+                                                                    decay_steps   = self.decay_steps,
+                                                                    decay_rate    = self.decay_rate,
+                                                                    staircase     = False)
+
             if self.isVAE:
                 with tf.name_scope("beta_scaled"):
-
-                    self.iter_beta_full = self.iter * self.beta_warmup
 
                     if self.beta_warmup != 0:
                         self.beta_scale = tf.clip_by_value(tf.cast(self.global_step, dtype = tf.float32) / (self.iter_beta_full), 0, 1)
@@ -438,9 +487,9 @@ class AutoEncoder(object):
             logging.info("beta: {}".format(self.beta))
             # self.KL_loss = self.create_KL_loss(beta = self.beta)
             self.KL_loss = self.beta_scaled * tfp.distributions.kl_divergence(self.z_dist.dist,
-                                                                           self.z_prior,
-                                                                           allow_nan_stats = False,
-                                                                           name = 'z_KL_divergence')
+                                                                              self.z_prior,
+                                                                              allow_nan_stats = False,
+                                                                              name = 'z_KL_divergence')
 
             logging.info(self.KL_loss)
 
@@ -467,10 +516,12 @@ class AutoEncoder(object):
         ## KL_loss
         if self.isVAE:
             self.KL_loss_scalar = tf.reduce_mean(self.KL_loss)
-            tf.losses.add_loss(self.KL_loss_scalar)
-            logging.info("KL_loss: {}".format(self.KL_loss_scalar.shape))
             logging.info(self.KL_loss_scalar)
             logging.info(self.KL_loss)
+            logging.info("KL_loss: {}".format(self.KL_loss_scalar.shape))
+        else:
+            self.KL_loss_scalar = tf.zeros(())
+        tf.losses.add_loss(self.KL_loss_scalar)
 
         ## total_loss
         self.total_loss = tf.losses.get_total_loss(name = 'total_loss',
@@ -510,13 +561,31 @@ class AutoEncoder(object):
         with tf.name_scope("train_op"):
 
             if self.optimizer_type == 'adam':
-                self.optimizer = tf.train.AdamOptimizer(self.decayed_learning_rate)
+                optimizer = tf.train.AdamOptimizer
+                # optimizer = tf.compat.v1.train.GradientDescentOptimizer
+
+            self.optimizer = optimizer(self.decayed_learning_rate)
 
             with tf.control_dependencies(update_ops):
-                optimizer = self.optimizer.minimize(loss = self.total_loss,
-                                                    global_step = self.global_step,
-                                                    var_list = self.theta)
-                self.train_op = optimizer
+
+                if not self.grad_clipping:
+
+                    optimize = self.optimizer.minimize(loss = self.total_loss,
+                                                       global_step = self.global_step,
+                                                       var_list = self.theta)
+
+                else:
+
+                    gvars = self.optimizer.compute_gradients(loss = self.total_loss,
+                                                             var_list = self.theta)
+                    gradients, variables = zip(*gvars)
+                    gradients, _ = tf.clip_by_global_norm(gradients, 5.0)
+                    optimize = self.optimizer.apply_gradients(grads_and_vars = zip(gradients, variables),
+                                                              global_step    = self.global_step)
+
+
+
+        self.train_op = optimize
 
         logging.info("train_op:")
         logging.info(self.train_op)
@@ -535,6 +604,10 @@ class AutoEncoder(object):
         self.h_dims_encoder = h_dims_encoder
         h_dims_decoder = self.h_dims[self.index_latent_embedding + 1:]
         self.h_dims_decoder = h_dims_decoder
+
+        ##
+        if self.use_batch:
+            h_temp = tf.concat([h_temp,self.batch],axis=1)
 
         ## Encoder
         prob_layer = self.build_encoder(h_temp = h_temp, h_dims = h_dims_encoder,
@@ -558,7 +631,14 @@ class AutoEncoder(object):
                     self.summary_list.append(tf.summary.histogram("z_logvar", self.z_logvar[0]))
 
         ## Decoder
-        prob_layer = self.build_decoder(h_temp = self.z_sample,
+        self.h_dims_decoder = h_dims_decoder
+        self.decoder_variable_scope = tf.get_variable_scope().name
+        h_temp = self.z_sample
+
+        if self.use_batch:
+            h_temp = tf.concat([h_temp,self.batch],axis=1)
+
+        prob_layer = self.build_decoder(h_temp = h_temp,
                                         h_dims = h_dims_decoder,
                                         variable_scope = "Decoder",
                                         kernel_initializer = self.kernel_initializer,
@@ -571,7 +651,7 @@ class AutoEncoder(object):
                 if self.isVAE and self.decoder_var != 'deterministic':
                     self.summary_list.append(tf.summary.histogram("X_var", self.X_var))
                     self.summary_list.append(tf.summary.histogram("X_logvar", self.X_logvar))
-                    self.summary_list.append(tf.summary.histogram("X_eps", self.X_eps[0]))
+                    # self.summary_list.append(tf.summary.histogram("X_eps", self.X_eps[0]))
 
         return self.X_sample
 
@@ -603,7 +683,12 @@ class AutoEncoder(object):
         if dataset is None:
             dataset = self.data_handler.dataset
 
-        train_data_full, test_data, y_train_full, y_test = dataset
+        if not self.use_batch:
+            train_data_full, test_data, y_train_full, y_test = dataset[:4]
+        else:
+            assert len(dataset) == 6, 'Dataset must contain batch info'
+            train_data_full, test_data, y_train_full, y_test, batch_train_full, batch_test = dataset[:6]
+
 
         # Split into validation
         if self.validation_split == 0:
@@ -611,23 +696,27 @@ class AutoEncoder(object):
             y_train = y_train_full
             validation_data = test_data
             y_validation = y_test
+            if self.use_batch:
+                batch_train = batch_train_full
+                batch_validation = batch_test
         else:
             len_train = int(train_data.shape[0])
             len_validate = int(len_train * self.validation_split)
             validation_data = train_data_full[:len_validate]
             train_data      = train_data_full[len_validate:]
-            y_validation    = y_train[:len_validate]
-            y_train         = y_train[len_validate:]
+            y_validation    = y_train_full[:len_validate]
+            y_train         = y_train_full[len_validate:]
+            if self.use_batch:
+                batch_validation = batch_train_full[:len_validate]
+                batch_train      = batch_train_full[len_validate:]
 
         logging.info("======================== Data Split =============================")
         logging.info("validation_data: " + str(validation_data.shape))
         logging.info("y_validation: " + str(y_validation.shape))
         logging.info("train_data: " + str(train_data.shape))
         logging.info("y_train: " + str(y_train.shape))
-        logging.info(np.min(np.std(y_train,0)))
         logging.info("test_data: " + str(test_data.shape))
         logging.info("y_test: " + str(y_test.shape))
-        logging.info(np.min(np.std(y_test,0)))
 
         if self.tensorboard:
             "Starting Tensorboard "
@@ -644,6 +733,11 @@ class AutoEncoder(object):
         feed_dict_validation  = self.initialize_feed_dict({self.X: validation_data,
                                                            self.X_target: y_validation})
 
+        if self.use_batch:
+            feed_dict_train[self.batch]      = batch_train
+            feed_dict_test[self.batch]       = batch_test
+            feed_dict_validation[self.batch] = batch_validation
+
         self.feed_dict_test       = feed_dict_test
         self.feed_dict_train      = feed_dict_train
         self.feed_dict_validation = feed_dict_validation
@@ -653,7 +747,7 @@ class AutoEncoder(object):
 
         # Set up for early stopping
         it_tb = -1 + initial_iter
-        it_test = 0
+        patience_count = 0
         it_min = 0
         min_loss = float("inf")
         result = None
@@ -689,9 +783,29 @@ class AutoEncoder(object):
         # Set up batch
         self.solvers = [self.train_op]
 
+        ## Pre-train losses
+        results = self.sess.run(self.losses, feed_dict = feed_dict_train)
+        zipped = zip(self.losses_name, results[-len(self.losses_name):])
+        format_args = [item for pack in zipped for item in pack]
+        str_report = "Pre-training: {}={:.4}" + ", {}={:.4}" * (len(self.losses_name)-1)
+        logging.info(str_report.format(*format_args))
+
+        ## Debugging code for predicting negative binomial
+        # print(self.sess.run(self.X_dist.library, feed_dict=feed_dict_train))
+        # print(self.sess.run(self.X_dist.mu_prob, feed_dict=feed_dict_train).sum(-1))
+        # print(self.sess.run(self.X_target, feed_dict=feed_dict_train).sum(-1))
+        # print(self.sess.run(self.X_dist.mu, feed_dict=feed_dict_train).sum(-1))
+
+        ## Debugging code for predicting negative binomial
+        print(self.decoder_layers)
+        print(self.hidden_layers)
+        # print(self.sess.run(self.X_dist.library, feed_dict=feed_dict_train))
+        # print(self.sess.run(self.X_dist.mu_prob, feed_dict=feed_dict_train).sum(-1))
+        # print(self.sess.run(self.X_target, feed_dict=feed_dict_train).sum(-1))
+        # print(self.sess.run(self.X_dist.mu, feed_dict=feed_dict_train).sum(-1))
+
         for it in range(iter):
             it_tb += 1
-            it_test += 1
 
             if self.dataAPI:
                 pass
@@ -699,8 +813,11 @@ class AutoEncoder(object):
                 pass
             else:
                 idx_out = batch.next_batch()
+                train_data.take(idx_out, axis = -2)
                 feed_dict[self.X] = train_data.take(idx_out, axis = -2)
                 feed_dict[self.X_target] =  y_train.take(idx_out, axis = -2)
+                if self.use_batch:
+                    feed_dict[self.batch] = batch_train.take(idx_out, axis = -2)
 
             ## Train a batch
             results = self.sess.run(self.solvers + self.losses, feed_dict = feed_dict)
@@ -719,6 +836,7 @@ class AutoEncoder(object):
                 ## Train Loss
                 results = sess.run(self.losses, feed_dict = feed_dict_train)
                 results_train = results[-len(self.losses_name):]
+
                 # Write to Summary (writing train data)
                 if self.tensorboard:
                     summary = results.pop(0)
@@ -762,16 +880,22 @@ class AutoEncoder(object):
                     str_report = "Validation: {}={:.4}" + ", {}={:.4}" * (len(self.losses_name)-1)
                     logging.info(str_report.format(*format_args))
 
-                if self.early_stopping > 0:
-                    logging.info("new min loss: {} vs old {}".format(results[-3], min_loss))
-                    delta = min_loss - results[-3]
-                    if delta > self.tolerance:
-                        it_min = it
-                        it_test = 0
-                        min_loss =  results[-3]
+                if self.early_stopping:
 
-                    elif it_test > self.early_stopping and it_tb > self.iter_min_early_stopping:
-                        break
+                    # idx_loss = self.losses_name.index('total loss')
+                    new_loss = results[-3]
+                    logging.info("Min loss - {} -> {}, patience_count={}".format(min_loss, new_loss,patience_count))
+                    delta = new_loss - min_loss
+
+                    if delta < self.tolerance:
+                        patience_count = 0
+                    else:
+                        if patience_count > self.max_patience_count and it_tb > self.iter_min_early_stopping:
+                            break
+                        else:
+                            patience_count += 1
+
+                    min_loss =  new_loss
 
         if result is None:
 
@@ -794,6 +918,9 @@ class AutoEncoder(object):
 
         full_data = self.data_handler.X.X
         feed_dict_full = self.initialize_feed_dict({self.X: full_data})
+        if self.use_batch:
+            feed_dict_full[self.batch] = self.data_handler.batch
+
         y_full = self.data_handler.y.X
 
         if self.save_recon:
@@ -802,7 +929,7 @@ class AutoEncoder(object):
 
             y_reconstruct = np.array(self.reconstruct_X(feed_dict_full))
             y_residual = y_full - y_reconstruct
-            y_result = np.array([y_full, y_reconstruct, y_residual])
+            y_result = np.array([y_full, y_reconstruct])
 
             logging.info("y_result.shape = {}".format(y_result.shape))
 
@@ -834,17 +961,11 @@ class AutoEncoder(object):
             output['decoder_layers'] = decoder_layers
 
             if self.isVAE and self.decoder_var != 'deterministic':
-                z_var = np.array(self.calculate_latent_variance(feed_dict_full))
                 logging.info("Saving z_var")
                 logging.info("=======================")
-                logging.info("self.z_logvar: {}".format(z_var.shape))
+                z_var = np.array(self.calculate_latent_variance(feed_dict_full))
                 output['z_var'] = z_var
-
-                X_var = np.array(self.calculate_decoder_variance(feed_dict_full))
-                logging.info("Saving X_var")
-                logging.info("=======================")
-                logging.info("self.X_var: {}".format(X_var.shape))
-                output['X_var'] = X_var
+                logging.info("self.z_logvar: {}".format(z_var.shape))
 
         if self.save_W:
             W = self.get_W()
@@ -854,7 +975,16 @@ class AutoEncoder(object):
             self.train_writer.close()
             self.test_writer.close()
 
-        return output
+            tb_scalars_train = extract_scalar_from_tensorboard(os.path.join(self.logdir_tf,'train'))
+            tb_scalars_test  = extract_scalar_from_tensorboard(os.path.join(self.logdir_tf,'test'))
+            scalars_dict = {'train': tb_scalars_train,
+                            'test' : tb_scalars_test}
+
+            output['scalars'] = scalars_dict
+
+        siVAE_results = output_handler(output)
+
+        return siVAE_results
 
 
     def start_tensorboard(self, train_writer = None, test_writer = None):
@@ -876,12 +1006,10 @@ class AutoEncoder(object):
 
         y_reconstruct = np.array(self.sess.run([self.X_out], feed_dict = feed_dict_test))
 
-        logging.info("y_reconstruct shape: {}".format(np.array(y_reconstruct).shape))
-
         return y_reconstruct
 
 
-    def reconstruct_X(self, feed_dict_in):
+    def reconstruct_X(self, feed_dict_in, component='mu'):
         """
         Calculate the X_reconstruct from the mean of the latent variables rather than sampled
         """
@@ -891,10 +1019,14 @@ class AutoEncoder(object):
         feed_dict_Wy = self.initialize_feed_dict({self.y_sample: y_mu})
 
         feed_dict_Wy = {self.y_sample: y_mu}
+        feed_dict_Wy.update(feed_dict_in)
 
-        X_reconstruct = np.array(self.sess.run(self.X_dist.mu, feed_dict = feed_dict_Wy))
+        if component == 'mu':
+            comp = self.X_dist.mu
+        elif component == 'var':
+            comp = self.X_dist.var
 
-        logging.info("X_reconstruct shape: {}".format(np.array(X_reconstruct).shape))
+        X_reconstruct = np.array(self.sess.run(comp, feed_dict = feed_dict_Wy))
 
         return X_reconstruct
 
@@ -906,8 +1038,6 @@ class AutoEncoder(object):
 
         y_reconstruct = np.array(self.sess.run(self.y_sample, feed_dict = feed_dict_test))
 
-        logging.info("y_reconstruct shape: {}".format(np.array(y_reconstruct).shape))
-
         return y_reconstruct
 
 
@@ -915,10 +1045,9 @@ class AutoEncoder(object):
         """ Calculate predicted mean of latent variable z from input data"""
 
         if sample:
-            z = np.array(self.sess.run(self.z_sample, feed_dict = feed_dict_input))
+            z = self.sess.run(self.z_sample, feed_dict = feed_dict_input)
         else:
-            z = np.array(self.sess.run(self.z_mu, feed_dict = feed_dict_input))
-        logging.info("z shape: {}".format(np.array(z).shape))
+            z = self.sess.run(self.z_mu, feed_dict = feed_dict_input)
 
         return z
 
@@ -926,9 +1055,12 @@ class AutoEncoder(object):
     def calculate_z_mu(self, feed_dict_input):
         """ Calculate predicted mean of latent variable z from input data"""
 
-        z_mu = np.array(self.sess.run(self.latent_embedding, feed_dict = feed_dict_input))
-
-        logging.info("z_mu shape: {}".format(np.array(z_mu).shape))
+        if self.z_mu in feed_dict_input.keys():
+            z_mu = feed_dict_input[self.z_mu]
+        elif self.z_sample in feed_dict_input.keys():
+            z_mu = feed_dict_input[self.z_sample]
+        else:
+            z_mu = self.sess.run(self.z_mu, feed_dict = feed_dict_input)
 
         return z_mu
 
@@ -941,9 +1073,8 @@ class AutoEncoder(object):
         if self.z_mu == self.y_mu:
             y_mu = z_mu
         else:
-            y_mu = np.array(self.sess.run(self.y_mu, feed_dict = {self.z_sample: z_mu}))
-
-        logging.info("y_mu: {}".format(np.array(y_mu).shape))
+            feed_dict_input.update({self.z_sample:z_mu})
+            y_mu = self.sess.run(self.y_mu, feed_dict = feed_dict_input)
 
         return y_mu
 
@@ -952,8 +1083,8 @@ class AutoEncoder(object):
         """ Calculate predicted mean of latent variable y from input data without sampling z """
 
         z = self.calculate_z(feed_dict_input, sample = sample_z)
-
-        hl_list = self.sess.run(self.decoder_layers, feed_dict = {self.z_sample: z})
+        feed_dict_input.update({self.z_sample:z})
+        hl_list = self.sess.run(self.decoder_layers, feed_dict = feed_dict_input)
 
         return hl_list
 
@@ -962,16 +1093,12 @@ class AutoEncoder(object):
         """ Calculate bottleneck layer from input data"""
         bottleneck = np.array(self.sess.run(self.z_var, feed_dict = feed_dict_test))
 
-        logging.info("bottleneck shape: {}".format(np.array(bottleneck).shape))
-
         return bottleneck
 
 
     def calculate_decoder_variance(self, feed_dict_test):
         """ Calculate bottleneck layer from input data"""
         var = np.array(self.sess.run(self.X_var, feed_dict = feed_dict_test))
-
-        logging.info("decoder variance shape: {}".format(np.array(var).shape))
 
         return var
 
@@ -980,11 +1107,21 @@ class AutoEncoder(object):
         """ Get W """
         W = np.array(self.sess.run(self.W))
 
-        logging.info("W shape: {}".format(W.shape))
-
         return W
 
 
     def update_feed_dict(self, feed_dict):
         """ Update the basic feed_dict """
         self.feed_dict.update(feed_dict)
+
+
+    def sample(self, n_sample):
+        """ Sample from prior z and infer X """
+
+        z_sampled = self.sess.run(self.z_prior.sample(n_sample))
+
+        feed_dict = self.initialize_feed_dict({self.z_sample:z_sampled})
+
+        X_reconstruct = np.array(self.sess.run(self.X_dist.mu, feed_dict = feed_dict))
+
+        return X_reconstruct

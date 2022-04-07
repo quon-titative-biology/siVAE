@@ -1,0 +1,14 @@
+R package requirements
+Seurat
+ggplot2
+Signac
+
+Pre-processing
+1. 1.3M brain cells by 10X (LargeBrainAtlas)
+
+2. SNARE-Seq dataset
+https://satijalab.org/signac/articles/snareseq.html
+We followed the example in the link above for preprocessing.
+
+Run model
+Use run_model.sh

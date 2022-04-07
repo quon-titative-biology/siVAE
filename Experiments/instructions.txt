@@ -1,0 +1,4 @@
+Part of scVI needs to be manually modified for the experiment.
+Install scVI with the following command, then replace the code at site with scVI on the folder
+
+pip install scvi-tools==0.8.1

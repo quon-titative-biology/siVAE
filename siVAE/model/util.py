@@ -3,6 +3,7 @@ import time
 import logging
 
 import tensorflow as tf
+from tensorboard.backend.event_processing import event_accumulator
 
 import numpy as np
 
@@ -32,6 +33,20 @@ def scope_name(scope):
             scope = '{}_{}'.format(root, count)
 
     return scope
+
+
+def extract_scalar_from_tensorboard(path):
+    """ Extract scalar from tensorboard in form of dictionary """
+    event_acc = event_accumulator.EventAccumulator(path)
+    event_acc.Reload()
+    data = {}
+    for tag in sorted(event_acc.Tags()["scalars"]):
+        x, y = [], []
+        for scalar_event in event_acc.Scalars(tag):
+          x.append(scalar_event.step)
+          y.append(scalar_event.value)
+        data[tag] = (np.asarray(x), np.asarray(y))
+    return data
 
 
 def reshape_sum(X, ImageDims):

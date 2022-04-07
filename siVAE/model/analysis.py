@@ -22,7 +22,7 @@ def residual_analysis(self, y_reconstruct, y_test, min_PVE = 0, take_mean = Fals
     RE = np.square(y_residual).mean(-2) # MSE per feature
     RE_mean = y_residual.mean(-2) # mean of residual per feature
     RE0 = np.square(y_test).mean(-2) # mean of test value per feature
-    logging.info("RE: {}".format(RE))
+    # logging.info("RE: {}".format(RE))
 
     if take_mean:
         RE = RE.mean(-1)
@@ -50,28 +50,38 @@ def residual_analysis(self, y_reconstruct, y_test, min_PVE = 0, take_mean = Fals
     return output
 
 
-def run_FI(input, target, sample_DE, de, method_DE, feed_dict, kwargs_FI = {}, masks = None):
-    """ """
+def run_FI(input, target, sample_DE, de, sess, method_DE, feed_dict, kwargs_FI = {}, masks = None, mode = 'forward'):
+    """
+    Run feature attribution
+    Parameters
+    ----------
+    mode
+        Run on forward or reverse mode for saliency maps or grad*input
+    """
+
     attributions_dict = {}
+
     start_time = time.time()
 
-    attributions = FI.DE_marginal(input     = input,
-                                  target    = target,
-                                  sample    = sample_DE,
-                                  de        = de,
-                                  method_DE = method_DE,
-                                  feed_dict = feed_dict,
-                                  masks     = masks,
-                                  **kwargs_FI)
+    attributions = FI.feature_attribution(input     = input,
+                                          target    = target,
+                                          sample    = sample_DE,
+                                          de        = de,
+                                          sess      = sess,
+                                          method_DE = method_DE,
+                                          feed_dict = feed_dict,
+                                          masks     = masks,
+                                          mode      = mode,
+                                          **kwargs_FI)
 
     duration = time.time() - start_time
 
     attributions_dict['input'] = sample_DE
     attributions_dict['score'] = attributions
     attributions_dict['duration'] = duration
+    attributions_dict['methods'] = method_DE
 
     return attributions_dict
-
 
 def calculate_decoder_layers(model, sampled_outputs):
     """ Calculate the output of decoder layers """

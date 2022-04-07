@@ -10,6 +10,7 @@ import bz2
 
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
+import umap.umap_ as umap
 
 import numpy as np
 import pandas as pd
@@ -17,6 +18,13 @@ import pandas as pd
 from pathlib import Path
 
 from sklearn.model_selection import train_test_split
+
+## Plots
+import matplotlib
+# matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.colors as colors
+import seaborn as sns
 
 def run_processor(fun, *args, **kwargs):
     """Run a function in processor using multiprocessing"""
@@ -116,37 +124,48 @@ def load_pickle(filename, zip_method=None, correct_suffix = True):
     return loaded
 
 
-def reduce_dimensions(X, reduced_dimension = 2, method = 'PCA', tsne_min = 50, match_dims = True):
+def reduce_dimensions(X, scale=False, reduced_dimension = 2, method = 'PCA', tsne_min = 50, match_dims = True,**kwargs):
     """
     Reduce dimensioanlity of X using dimensionality reduction method.
     """
     if X.shape[-1] > reduced_dimension:
-
+        #
         if method == "PCA":
-            pca = PCA(n_components = reduced_dimension)
+            pca = PCA(n_components = reduced_dimension,**kwargs)
             pca.fit(X)
             X_pca = pca.transform(X)
             X_reduced = X_pca[:,:reduced_dimension]
-            dim_name = 'pc'
-
+            dim_name = 'PC'
+            #
         elif method == "tSNE":
             if X.shape[-1] > tsne_min:
-                X,_ = reduce_dimensions(X, reduced_dimension = 50, method = 'PCA')
-            tsne = TSNE(n_components = reduced_dimension, init = 'pca')
+                X,_ = reduce_dimensions(X, reduced_dimension = tsne_min, method = 'PCA')
+            tsne = TSNE(n_components = reduced_dimension, init = 'pca', **kwargs)
             X_tsne = tsne.fit_transform(X)
             X_reduced = X_tsne[:,:2]
             dim_name = 't-SNE'
+            #
+        elif method == 'UMAP':
+            if X.shape[-1] > tsne_min:
+                X,_ = reduce_dimensions(X, reduced_dimension = tsne_min, method = 'PCA')
+            X_reduced = umap.UMAP(**kwargs).fit_transform(X)
+            X_reduced = X_reduced[:,:2]
+            dim_name = 'UMAP'
+            #
+        else:
+            raise Exception('{} is not a valid DR method (PCA,tSNE,UMAP)'.format(method))
+            #
     else:
-
+        #
         if X.shape[-1] < reduced_dimension and match_dims:
             dim_diff = reduced_dimension - X.shape[-1]
             X_reduced = np.concatenate([X, np.zeros([len(X),dim_diff])], axis = 1)
         else:
             X_reduced = X
-
-        dim_name = "dim"
-
-    dim_labels = ["{}_{}".format(dim_name, ii) for ii in range(reduced_dimension)]
+            #
+        dim_name = "Dim"
+        #
+    dim_labels = ["{} {}".format(dim_name, ii+1) for ii in range(reduced_dimension)]
     return X_reduced, dim_labels
 
 
@@ -160,26 +179,52 @@ def load_df_from_npz(filename):
     return df
 
 
-def reduce_samples(X, label_in, num_reduced = 10000, type='all'):
+def reduce_samples(X, label_in, num_reduced = 10000, mode='sample'):
     """
-    type = ['sample', 'PCA', 'all']
+    type = ['sample', 'PCA']
     """
-
-    if type == 'sample':
-        test_size= num_reduced/len(X)
-        if test_size < 1:
-            _,X_new,_,_ = train_test_split(X,label_in,test_size=test_size,stratify=label_in)
-
-    elif type == 'PCA':
-        X_t         = X.transpose()
-        num_reduced = min(num_reduced, X_t.shape[0])
-        X_new , _   = reduce_dimensions(X_t, reduced_dimension = num_reduced, method = 'PCA')
-        X_new       = X_new.transpose()
-
-    elif type == 'all':
-        X_new = X
-
+    #
+    if X.shape[0] > num_reduced:
+        #
+        if mode == 'sample':
+            test_size= num_reduced/len(X)
+            if test_size < 1:
+                _,X_new,_,_ = train_test_split(X,label_in,test_size=test_size,stratify=label_in)
+                #
+        elif mode == 'PCA':
+            X_t         = X.transpose()
+            num_reduced = min(num_reduced, X_t.shape[0])
+            X_new , _   = reduce_dimensions(X_t, reduced_dimension = num_reduced, method = 'PCA')
+            X_new       = X_new.transpose()
+            #
+        else:
+            raise Exception('Input valid reduce mode')
+            #
     else:
-        raise Exception('Input valid VAE_feature_input ')
-
+        #
+        X_new = X
+        #
     return X_new
+
+
+def remove_spines(ax,yaxis=True,xaxis=True,num_ticks=3,show_legend=True):
+    if yaxis:
+        ax.yaxis.set_major_locator(plt.MaxNLocator(num_ticks))
+    if xaxis:
+        ax.xaxis.set_major_locator(plt.MaxNLocator(num_ticks))
+    # Hide the right and top spines
+    ax.spines['right'].set_visible(False)
+    ax.spines['top'].set_visible(False)
+    ax.spines['left'].set_linewidth(2)
+    ax.spines['bottom'].set_linewidth(2)
+    # Only show ticks on the left and bottom spines
+    ax.yaxis.set_ticks_position('left')
+    ax.xaxis.set_ticks_position('bottom')
+    ##
+    if show_legend:
+        # lgd = plt.legend(bbox_to_anchor=(1.05, 1), loc=2, borderaxespad=0.)
+        legend = plt.legend(edgecolor='black')
+        legend.get_frame().set_alpha(1)
+    else:
+        if ax.legend_ is not None:
+            ax.legend_.remove()

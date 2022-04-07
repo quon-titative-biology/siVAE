@@ -1,0 +1,18 @@
+R package requirement
+ggplot2, reticulate, minet, destiny
+
+Python package requirement
+arboreto
+
+GRNBOOST2 requires python package arboreto
+Gene relevance requires R package destiny
+
+#### Download datasets
+The fetal liver atlas dataset was downloaded from
+https://www.ebi.ac.uk/arrayexpress/experiments/E-MTAB-7407/.
+Download and place in ./data/zipfiles directory.
+Manually run the commands in the bash script in data folder.
+
+#### Run model analysis
+Run the following command in the main siVAE directory
+bash Experiments/FetalLiverExperiment/run_FetalLiver.sh
