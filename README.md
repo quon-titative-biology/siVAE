@@ -20,7 +20,7 @@ siVAE requires installation of siVAE package as well as modified deepexplain fro
 Install siVAE by running the following command on the package file.
 
 ```
-pip install -e siVAE
+pip install siVAE
 ```
 
 The package requires tensorflow >= 1.15 and tensorflow probability. In addition, installation of tensorflow-gpu is recommended for faster performance.
