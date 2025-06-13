@@ -1,3 +1,12 @@
+# New second generation model available
+We have published a new model called sciLaMA that extends and outperforms siVAE, to be published in ICML 2025, preprint available here:
+
+https://www.biorxiv.org/content/10.1101/2025.01.28.635153v2.abstract
+
+The associated GitHub repo is here:
+
+https://github.com/microsoft/sciLaMA
+
 
 # scalable, interpretable Variational Autoencoder (siVAE)
 
